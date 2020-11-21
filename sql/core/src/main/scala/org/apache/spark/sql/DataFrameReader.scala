@@ -600,6 +600,9 @@ class DataFrameReader private[sql](sparkSession: SparkSession) extends Logging {
    * If the enforceSchema is set to `false`, only the CSV header in the first line is checked
    * to conform specified or inferred schema.
    *
+   * @note if `header` option is set to `true` when calling this API, all lines same with
+   * the header will be removed if exists.
+   *
    * @param csvDataset input Dataset with one CSV row per record
    * @since 2.2.0
    */
@@ -822,8 +825,16 @@ class DataFrameReader private[sql](sparkSession: SparkSession) extends Logging {
   def orc(paths: String*): DataFrame = format("orc").load(paths: _*)
 
   /**
-   * Returns the specified table as a `DataFrame`.
+   * Returns the specified table/view as a `DataFrame`. If it's a table, it must support batch
+   * reading and the returned DataFrame is the batch scan query plan of this table. If it's a view,
+   * the returned DataFrame is simply the query plan of the view, which can either be a batch or
+   * streaming query plan.
    *
+   * @param tableName is either a qualified or unqualified name that designates a table or view.
+   *                  If a database is specified, it identifies the table/view from the database.
+   *                  Otherwise, it first attempts to find a temporary view with the given name
+   *                  and then match the table/view from the current database.
+   *                  Note that, the global temporary view database is also valid here.
    * @since 1.4.0
    */
   def table(tableName: String): DataFrame = {

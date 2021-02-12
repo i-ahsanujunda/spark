@@ -274,7 +274,8 @@ class KubernetesSuite extends SparkFunSuite
       isJVM: Boolean,
       pyFiles: Option[String] = None,
       executorPatience: Option[(Option[Interval], Option[Timeout])] = None,
-      decommissioningTest: Boolean = false): Unit = {
+      decommissioningTest: Boolean = false,
+      env: Map[String, String] = Map.empty[String, String]): Unit = {
 
   // scalastyle:on argcount
     val appArguments = SparkAppArguments(
@@ -344,8 +345,11 @@ class KubernetesSuite extends SparkFunSuite
                 }
                 // Delete the pod to simulate cluster scale down/migration.
                 // This will allow the pod to remain up for the grace period
+                // We set an intentionally long grace period to test that Spark
+                // exits once the blocks are done migrating and doesn't wait for the
+                // entire grace period if it does not need to.
                 kubernetesTestComponents.kubernetesClient.pods()
-                  .withName(name).delete()
+                  .withName(name).withGracePeriod(Int.MaxValue).delete()
                 logDebug(s"Triggered pod decom/delete: $name deleted")
                 // Make sure this pod is deleted
                 Eventually.eventually(TIMEOUT, INTERVAL) {
@@ -370,7 +374,8 @@ class KubernetesSuite extends SparkFunSuite
       TIMEOUT.value.toSeconds.toInt,
       sparkHomeDir,
       isJVM,
-      pyFiles)
+      pyFiles,
+      env)
 
     val driverPod = kubernetesTestComponents.kubernetesClient
       .pods()

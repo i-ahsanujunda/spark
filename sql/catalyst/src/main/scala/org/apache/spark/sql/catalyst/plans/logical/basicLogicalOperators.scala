@@ -18,11 +18,10 @@
 package org.apache.spark.sql.catalyst.plans.logical
 
 import org.apache.spark.sql.catalyst.AliasIdentifier
-import org.apache.spark.sql.catalyst.analysis.{EliminateView, MultiInstanceRelation}
+import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
-import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning}
 import org.apache.spark.sql.catalyst.util.truncatedString
@@ -38,6 +37,7 @@ import org.apache.spark.util.random.RandomSampler
  * at the top of the logical query plan.
  */
 case class ReturnAnswer(child: LogicalPlan) extends UnaryNode {
+  override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
 }
 
@@ -217,7 +217,7 @@ object Union {
 }
 
 /**
- * Logical plan for unioning two plans, without a distinct. This is UNION ALL in SQL.
+ * Logical plan for unioning multiple plans, without a distinct. This is UNION ALL in SQL.
  *
  * @param byName          Whether resolves columns in the children by column names.
  * @param allowMissingCol Allows missing columns in children query plans. If it is true,
@@ -327,6 +327,25 @@ case class Join(
     hint: JoinHint)
   extends BinaryNode with PredicateHelper {
 
+  override def maxRows: Option[Long] = {
+    joinType match {
+      case Inner | Cross | FullOuter | LeftOuter | RightOuter
+        if left.maxRows.isDefined && right.maxRows.isDefined =>
+        val maxRows = BigInt(left.maxRows.get) * BigInt(right.maxRows.get)
+        if (maxRows.isValidLong) {
+          Some(maxRows.toLong)
+        } else {
+          None
+        }
+
+      case LeftSemi | LeftAnti =>
+        left.maxRows
+
+      case _ =>
+        None
+    }
+  }
+
   override def output: Seq[Attribute] = {
     joinType match {
       case j: ExistenceJoin =>
@@ -431,7 +450,6 @@ case class InsertIntoDir(
  *
  * @param desc A view description(CatalogTable) that provides necessary information to resolve the
  *             view.
- * @param output The output of a view operator, this is generated during planning the view, so that
  *               we are able to decouple the output from the underlying structure.
  * @param child The logical plan of a view operator, it should be a logical plan parsed from the
  *              `CatalogTable.viewText`, should throw an error if the `viewText` is not defined.
@@ -439,37 +457,33 @@ case class InsertIntoDir(
 case class View(
     desc: CatalogTable,
     isTempView: Boolean,
-    output: Seq[Attribute],
-    child: LogicalPlan) extends LogicalPlan with MultiInstanceRelation {
+    child: LogicalPlan) extends UnaryNode {
 
-  override def producedAttributes: AttributeSet = outputSet
-
-  override lazy val resolved: Boolean = child.resolved
-
-  override def children: Seq[LogicalPlan] = child :: Nil
-
-  override def newInstance(): LogicalPlan = copy(output = output.map(_.newInstance()))
+  override def output: Seq[Attribute] = child.output
 
   override def simpleString(maxFields: Int): String = {
     s"View (${desc.identifier}, ${output.mkString("[", ",", "]")})"
   }
 
-  override def doCanonicalize(): LogicalPlan = {
-    def sameOutput(
-      outerProject: Seq[NamedExpression], innerProject: Seq[NamedExpression]): Boolean = {
-      outerProject.length == innerProject.length &&
-        outerProject.zip(innerProject).forall {
-          case(outer, inner) => outer.name == inner.name && outer.dataType == inner.dataType
-        }
-    }
+  override def doCanonicalize(): LogicalPlan = child match {
+    case p: Project if p.resolved && canRemoveProject(p) => p.child.canonicalized
+    case _ => child.canonicalized
+  }
 
-    val eliminated = EliminateView(this) match {
-      case Project(viewProjectList, child @ Project(queryProjectList, _))
-        if sameOutput(viewProjectList, queryProjectList) =>
-        child
-      case other => other
+  // When resolving a SQL view, we use an extra Project to add cast and alias to make sure the view
+  // output schema doesn't change even if the table referenced by the view is changed after view
+  // creation. We should remove this extra Project during canonicalize if it does nothing.
+  // See more details in `SessionCatalog.fromCatalogTable`.
+  private def canRemoveProject(p: Project): Boolean = {
+    p.output.length == p.child.output.length && p.projectList.zip(p.child.output).forall {
+      case (Alias(cast: CastBase, name), childAttr) =>
+        cast.child match {
+          case a: AttributeReference =>
+            a.dataType == cast.dataType && a.name == name && childAttr.semanticEquals(a)
+          case _ => false
+        }
+      case _ => false
     }
-    eliminated.canonicalized
   }
 }
 
@@ -484,21 +498,6 @@ object View {
       sqlConf.settings.put(k, v)
     }
     sqlConf
-  }
-
-  def fromCatalogTable(
-      metadata: CatalogTable, isTempView: Boolean, parser: ParserInterface): View = {
-    val viewText = metadata.viewText.getOrElse(sys.error("Invalid view without text."))
-    val viewConfigs = metadata.viewSQLConfigs
-    val viewPlan =
-      SQLConf.withExistingConf(effectiveSQLConf(viewConfigs, isTempView = isTempView)) {
-        parser.parsePlan(viewText)
-      }
-    View(
-      desc = metadata,
-      isTempView = isTempView,
-      output = metadata.schema.toAttributes,
-      child = viewPlan)
   }
 }
 
@@ -590,8 +589,16 @@ case class Range(
     s"Range ($start, $end, step=$step, splits=$numSlices)"
   }
 
+  override def maxRows: Option[Long] = {
+    if (numElements.isValidLong) {
+      Some(numElements.toLong)
+    } else {
+      None
+    }
+  }
+
   override def computeStats(): Statistics = {
-    Statistics(sizeInBytes = LongType.defaultSize * numElements)
+    Statistics(sizeInBytes = LongType.defaultSize * numElements, rowCount = Some(numElements))
   }
 
   override def outputOrdering: Seq[SortOrder] = {
@@ -651,7 +658,7 @@ case class Window(
     partitionSpec: Seq[Expression],
     orderSpec: Seq[SortOrder],
     child: LogicalPlan) extends UnaryNode {
-
+  override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] =
     child.output ++ windowExpressions.map(_.toAttribute)
 
@@ -990,6 +997,7 @@ case class Sample(
       s"Sampling fraction ($fraction) must be on interval [0, 1] without replacement")
   }
 
+  override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
 }
 
@@ -1007,6 +1015,7 @@ case class Distinct(child: LogicalPlan) extends UnaryNode {
 abstract class RepartitionOperation extends UnaryNode {
   def shuffle: Boolean
   def numPartitions: Int
+  override final def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
 }
 
@@ -1057,7 +1066,6 @@ case class RepartitionByExpression(
     }
   }
 
-  override def maxRows: Option[Long] = child.maxRows
   override def shuffle: Boolean = true
 }
 
@@ -1090,7 +1098,7 @@ case class OneRowRelation() extends LeafNode {
 case class Deduplicate(
     keys: Seq[Attribute],
     child: LogicalPlan) extends UnaryNode {
-
+  override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
 }
 
